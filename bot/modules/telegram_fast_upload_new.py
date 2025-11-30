@@ -6,6 +6,10 @@ from typing import Optional
 
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError
+try:
+    from telethon.errors import AuthKeyNotFound, BrokenAuthKeyError
+except Exception:
+    AuthKeyNotFound = BrokenAuthKeyError = None  # type: ignore
 from telethon.sessions import StringSession
 from telethon.tl import types
 
@@ -45,6 +49,17 @@ def _get_user_session_string() -> str:
     return ""
 
 
+async def _reset_client():
+    global _client
+    if _client is None:
+        return
+    try:
+        await _client.disconnect()
+    except Exception:
+        pass
+    _client = None
+
+
 async def _get_client(api_id: int, api_hash: str, _bot_token_ignored: str) -> TelegramClient:
     """
     Create/return a Telethon client authenticated with a USER StringSession.
@@ -52,11 +67,13 @@ async def _get_client(api_id: int, api_hash: str, _bot_token_ignored: str) -> Te
     but is ignored. We always use the USER session here.
     """
     global _client
+    auth_errors = tuple(err for err in (AuthKeyNotFound, BrokenAuthKeyError) if isinstance(err, type))
+
     async with _client_lock:
         if _client and _client.is_connected():
             return _client
 
-        user_session_string = "1AZWarzwBu0nknj1A7d3h4IjxaDLrlXd211gkKvk7fH90r8Ui-M4VFubiyPWsM8h0XxvJDOtV9rWepmJnWhbVQcFy8iMm-K2pzK-3g-FxjrGiWS8P3P3Evcv1P41QCjE6RvQBef-kSijo1R00s5aL_K4LP9Vq38jHm2dTDx9BrfChupVK38QuOHRDAoze53Uz0YQrKSZcH0mtYgPf_Mr81IGu7gDt_HeLkcWAyjvAaDsFLf5C6yQUCGY3UJSgnVIIRSIoEKaOY5_rokuSeNi2RVpxm7hDT7wppYY94FyzDvVCH7OkpRcYXgnf09J0mbFdhH1JUPF-7Ffv_GvJKmt-R-K1-RLfAPw="
+        user_session_string = _get_user_session_string()
         if not user_session_string:
             raise RuntimeError(
                 "USER_SESSION_STRING is missing/empty. "
@@ -67,11 +84,17 @@ async def _get_client(api_id: int, api_hash: str, _bot_token_ignored: str) -> Te
         _client = TelegramClient(session, api_id, api_hash)
         await _client.connect()
 
-        # StringSession should already be authorized; if not, we cannot proceed without 2FA/phone code.
-        if not await _client.is_user_authorized():
-            raise RuntimeError(
-                "Telethon user is not authorized. Please regenerate USER_SESSION_STRING with a logged-in account."
-            )
+        try:
+            # StringSession should already be authorized; if not, we cannot proceed without 2FA/phone code.
+            if not await _client.is_user_authorized():
+                raise RuntimeError(
+                    "Telethon user is not authorized. Please regenerate USER_SESSION_STRING with a logged-in account."
+                )
+        except Exception as exc:
+            if auth_errors and isinstance(exc, auth_errors):
+                await _reset_client()
+                return await _get_client(api_id, api_hash, _bot_token_ignored)
+            raise
 
         return _client
 
@@ -159,6 +182,54 @@ def _fmt_time(seconds: float | None) -> str:
     return f"{s}s"
 
 
+async def _upload_with_retry(
+    client: TelegramClient,
+    api_id: int,
+    api_hash: str,
+    bot_token: str,
+    file_path: str,
+    *,
+    progress_cb=None,
+    progress_msg=None,
+    progress_text_fn=None,
+):
+    """
+    Upload a file with retries for the user session, rebuilding the session on
+    auth failures and gracefully handling transient MTProto/network issues.
+    """
+
+    last_exc: Exception | None = None
+    auth_errors = tuple(err for err in (AuthKeyNotFound, BrokenAuthKeyError) if isinstance(err, type))
+
+    for attempt in range(1, 5):
+        try:
+            if fast_upload is not None and progress_msg is not None and progress_text_fn:
+                return await fast_upload(
+                    client,
+                    file_path,
+                    name=os.path.basename(file_path),
+                    reply=progress_msg,
+                    progress_bar_function=progress_text_fn,
+                )
+            return await client.upload_file(file=file_path, progress_callback=progress_cb)
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                await asyncio.sleep(exc.seconds)
+                continue
+            if auth_errors and isinstance(exc, auth_errors):
+                last_exc = exc
+                await _reset_client()
+                client = await _get_client(api_id, api_hash, bot_token)
+                continue
+
+            last_exc = exc
+            await asyncio.sleep(min(30, 2 ** attempt))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Upload retry loop exited unexpectedly")
+
+
 async def fast_send_video(
     api_id: int,
     api_hash: str,
@@ -244,17 +315,16 @@ async def fast_send_video(
         last_b = done
         return _make_text(done, total, speed)
 
-    if fast_upload is not None:
-        input_file = await fast_upload(
-            client,
-            file_path,
-            name=os.path.basename(file_path),
-            reply=progress_msg,                     # <- enables live edits
-            progress_bar_function=_progress_text,   # <- returns text for each update
-        )
-    else:
-        # fallback (slower) – still functional if helper missing
-        input_file = await client.upload_file(file=file_path, progress_callback=progress_cb)
+    input_file = await _upload_with_retry(
+        client,
+        api_id,
+        api_hash,
+        bot_token,
+        file_path,
+        progress_cb=progress_cb,
+        progress_msg=progress_msg,
+        progress_text_fn=_progress_text,
+    )
 
     sent = await client.send_file(
         peer,

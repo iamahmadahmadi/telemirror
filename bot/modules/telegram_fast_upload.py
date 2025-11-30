@@ -42,14 +42,37 @@ _client: Optional[TelegramClient] = None
 _client_lock = asyncio.Lock()
 
 
+async def _reset_client():
+    """Dispose of the cached client on fatal errors so the next attempt rebuilds it."""
+
+    global _client
+    if _client is None:
+        return
+    try:
+        await _client.disconnect()
+    except Exception:
+        pass
+    _client = None
+
+
 async def _get_client(api_id: int, api_hash: str, bot_token: str) -> TelegramClient:
+    """Return a connected, authorized Telethon client (bot session)."""
+
     global _client
     async with _client_lock:
         if _client and _client.is_connected():
             return _client
+
         _client = TelegramClient("fast_uploader", api_id, api_hash)
         await _client.connect()
-        if not await _client.is_user_authorized():
+        try:
+            if not await _client.is_user_authorized():
+                await _client.sign_in(bot_token=bot_token)
+        except (AuthKeyNotFound, BrokenAuthKeyError):
+            # Corrupted session, rebuild from scratch
+            await _reset_client()
+            _client = TelegramClient("fast_uploader", api_id, api_hash)
+            await _client.connect()
             await _client.sign_in(bot_token=bot_token)
         return _client
 
@@ -97,6 +120,58 @@ def _fmt_time(seconds: float | None) -> str:
     if m:
         return f"{m}m {s}s"
     return f"{s}s"
+
+
+async def _upload_with_retry(
+    client: TelegramClient,
+    api_id: int,
+    api_hash: str,
+    bot_token: str,
+    file_path: str,
+    *,
+    progress_cb=None,
+    progress_msg=None,
+    progress_text_fn=None,
+):
+    """
+    Upload a file with retries, handling transient MTProto/network glitches and
+    automatically rebuilding the client session on fatal auth issues. Falls back
+    to native Telethon uploads if FastTelethonhelper is unavailable.
+    """
+
+    last_exc: Exception | None = None
+    auth_errors = tuple(
+        err for err in (InvalidBufferError, AuthKeyNotFound, BrokenAuthKeyError) if isinstance(err, type)
+    )
+
+    for attempt in range(1, 5):
+        try:
+            if fast_upload is not None and progress_msg is not None and progress_text_fn:
+                return await fast_upload(
+                    client,
+                    file_path,
+                    name=os.path.basename(file_path),
+                    reply=progress_msg,
+                    progress_bar_function=progress_text_fn,
+                )
+            return await client.upload_file(file=file_path, progress_callback=progress_cb)
+        except Exception as exc:
+            if isinstance(exc, FloodWaitError):
+                await asyncio.sleep(exc.seconds)
+                continue
+            if auth_errors and isinstance(exc, auth_errors):
+                last_exc = exc
+                await _reset_client()
+                client = await _get_client(api_id, api_hash, bot_token)
+                continue
+
+            last_exc = exc
+            # brief exponential backoff to smooth over transient network issues
+            await asyncio.sleep(min(30, 2 ** attempt))
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Upload retry loop exited unexpectedly")
 
 
 async def fast_send_video(
@@ -184,17 +259,16 @@ async def fast_send_video(
         last_b = done
         return _make_text(done, total, speed)
 
-    if fast_upload is not None:
-        input_file = await fast_upload(
-            client,
-            file_path,
-            name=os.path.basename(file_path),
-            reply=progress_msg,                     # <- enables live edits
-            progress_bar_function=_progress_text,   # <- returns text for each update
-        )
-    else:
-        # fallback (slower) – still functional if helper missing
-        input_file = await client.upload_file(file=file_path, progress_callback=progress_cb)
+    input_file = await _upload_with_retry(
+        client,
+        api_id,
+        api_hash,
+        bot_token,
+        file_path,
+        progress_cb=progress_cb,
+        progress_msg=progress_msg,
+        progress_text_fn=_progress_text,
+    )
 
     sent = await client.send_file(
         peer,
@@ -313,17 +387,16 @@ async def fast_send_document(
         last_b = done
         return _make_text(done, total, speed)
 
-    if fast_upload is not None:
-        input_file = await fast_upload(
-            client,
-            file_path,
-            name=os.path.basename(file_path),
-            reply=progress_msg,
-            progress_bar_function=_progress_text,
-        )
-    else:
-        # fallback to Telethon upload_file
-        input_file = await client.upload_file(file=file_path, progress_callback=progress_cb)
+    input_file = await _upload_with_retry(
+        client,
+        api_id,
+        api_hash,
+        bot_token,
+        file_path,
+        progress_cb=progress_cb,
+        progress_msg=progress_msg,
+        progress_text_fn=_progress_text,
+    )
 
     sent = await client.send_file(
         peer,
